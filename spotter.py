@@ -133,6 +133,15 @@ def pick():
     # stronger vote that overrides everything else.
     ac.sort(key=lambda a: -interest(a, a["_d"]))
     any_inbound = any(a["_approaching"] for a in ac)
+
+    now = time.time()
+    held = next((a for a in ac if (a.get("flight") or "").strip() == _sticky["cs"]), None)
+    if held is not None and now - _sticky["since"] < STICKY_SECONDS:
+        if interest(ac[0], ac[0]["_d"]) - interest(held, held["_d"]) < STICKY_MARGIN:
+            ac.remove(held); ac.insert(0, held)          # hold focus
+    chosen = (ac[0].get("flight") or "").strip()
+    if chosen != _sticky["cs"]:
+        _sticky["cs"], _sticky["since"] = chosen, now
     return ac, len(ac), any_inbound
 
 def as_contact(a):
@@ -245,6 +254,16 @@ def heading_arrow(deg):
     same way, so a column of matching arrows IS the approach line.
     """
     return "↑↗→↘↓↙←↖"[int(((deg % 360) + 22.5) % 360 // 45)]
+
+# ── stickiness ───────────────────────────────────────────────────────────────
+# Without this the primary swaps every poll as aircraft trade places in the
+# scoring, and the label jumps while you are trying to read it. Once a plane is
+# chosen, keep it until it leaves range or something clearly better turns up.
+# Aircraft take minutes to cross; the display should not change its mind every
+# twenty seconds.
+STICKY_SECONDS = 90      # how long to hold a chosen aircraft
+STICKY_MARGIN  = 25      # how much better a rival must score to steal focus
+_sticky = {"cs": None, "since": 0.0}
 
 OFF_FLAG = Path.home() / ".config/rangerpuck/radar-off"
 
