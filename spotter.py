@@ -15,13 +15,14 @@ screen instead of jumping — the same trick a real radar display uses.
   ./spotter.py --watch     keep watching, updating the radar
   ./spotter.py --clear     clear the radar
 """
-import sys, os, json, math, time, urllib.request
+import sys, os, json, math, time, subprocess, urllib.request
 from pathlib import Path
 
 def _cfg(name, default):
-    """Your location stays OUT of the source. Set it in ~/.config/rangerpuck/spotter.env
-    or as an environment variable. Default below is Dublin Airport, so the thing
-    does something sensible before you configure it."""
+    """Location stays OUT of the source — env var, else ~/.config/rangerpuck/spotter.env,
+    else the default. Same file siren.py reads, so one place sets every collector.
+    The default is Dublin Airport: the tool does something sensible unconfigured,
+    and a clone of this never carries anybody's address."""
     v = os.environ.get(name)
     if v: return v
     f = Path.home() / ".config/rangerpuck/spotter.env"
@@ -32,16 +33,28 @@ def _cfg(name, default):
                 return line.split("=", 1)[1].strip().strip('"').strip("'")
     return default
 
-LAT = float(_cfg("SPOTTER_LAT", 53.4264))      # Dublin Airport — change this
-LON = float(_cfg("SPOTTER_LON", -6.2499))
+LAT      = float(_cfg("SPOTTER_LAT", 53.4264))     # Dublin Airport
+LON      = float(_cfg("SPOTTER_LON", -6.2499))
 RANGE_KM = float(_cfg("SPOTTER_RANGE_KM", 40))
-CACHE = Path.home() / ".config/rangerpuck/ip"
+SEND = Path.home() / "esp32-projects/1-ranger-puck/tools/send.sh"
+CACHE = Path.home() / ".ranger-memory/config/rangerpuck.ip"
+
+class FeedDown(Exception):
+    """adsb.lol is unreachable, rate-limiting, or returning something unusable.
+    A named exception so callers can report "the feed is down" rather than either
+    crashing or — worse — treating it as an empty sky."""
 
 def fetch():
     url = f"https://api.adsb.lol/v2/point/{LAT}/{LON}/{int(RANGE_KM/1.852)}"
     req = urllib.request.Request(url, headers={"User-Agent": "plane-spotter/0.1"})
-    with urllib.request.urlopen(req, timeout=15) as r:
-        return json.load(r).get("ac", [])
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.load(r).get("ac", [])
+    except Exception as e:
+        # NEVER return [] here. An empty list means "clear sky", which is a
+        # statement about the world; this is "we do not know". Conflating them
+        # would clear the radar on every network blip.
+        raise FeedDown(f"{type(e).__name__}: {e}") from e
 
 def offsets(lat, lon):
     """km east / km north of the house — flat-earth is fine over 40km."""
@@ -155,6 +168,7 @@ def compass(d):
             "S","SSW","SW","WSW","W","WNW","NW","NNW"][int((d + 11.25) % 360 // 22.5)]
 
 AIRBORNE_FT = 300      # below this it is taxiing or on the roll at Dublin, not overhead
+GONE_KM     = 12       # once it is past AND this far, it is somebody else's plane now
 
 def interest(a, d):
     """Which aircraft is worth showing?
@@ -201,10 +215,12 @@ def pick():
     ac.sort(key=lambda a: -interest(a, a["_d"]))
     any_inbound = any(a["_approaching"] for a in ac)
 
+    # keep the aircraft we are already following, unless it is gone or clearly beaten
     now = time.time()
     held = next((a for a in ac if (a.get("flight") or "").strip() == _sticky["cs"]), None)
     if held is not None and now - _sticky["since"] < STICKY_SECONDS:
-        if interest(ac[0], ac[0]["_d"]) - interest(held, held["_d"]) < STICKY_MARGIN:
+        best = interest(ac[0], ac[0]["_d"])
+        if best - interest(held, held["_d"]) < STICKY_MARGIN:
             ac.remove(held); ac.insert(0, held)          # hold focus
     chosen = (ac[0].get("flight") or "").strip()
     if chosen != _sticky["cs"]:
@@ -338,58 +354,47 @@ def heading_arrow(deg):
 
 # ── stickiness ───────────────────────────────────────────────────────────────
 # Without this the primary swaps every poll as aircraft trade places in the
-# scoring, and the label jumps while you are trying to read it. Once a plane is
-# chosen, keep it until it leaves range or something clearly better turns up.
-# Aircraft take minutes to cross; the display should not change its mind every
-# twenty seconds.
-STICKY_SECONDS = 90      # how long to hold a chosen aircraft
-STICKY_MARGIN  = 25      # how much better a rival must score to steal focus
+# scoring, and the label jumps around while you are trying to read it. Once a
+# plane is chosen, keep it until it leaves range, lands, or something clearly
+# more interesting turns up. Aircraft take minutes to cross; the display should
+# not change its mind every twenty seconds.
+STICKY_SECONDS   = 90      # how long to hold a chosen aircraft
+STICKY_MARGIN    = 25      # how much better a rival must score to steal focus
 _sticky = {"cs": None, "since": 0.0}
 
-OFF_FLAG = Path.home() / ".config/rangerpuck/radar-off"
+OFF_FLAG = Path.home() / ".ranger-memory/config/.radar-off"
 
 if __name__ == "__main__":
     try:
         if "--off" in sys.argv:
-            OFF_FLAG.parent.mkdir(parents=True, exist_ok=True)
-            OFF_FLAG.touch()
-            clear()
-            print("  radar OFF — ./spotter.py --on to bring it back")
-            sys.exit()
-
+            OFF_FLAG.parent.mkdir(parents=True, exist_ok=True); OFF_FLAG.touch()
+            clear(); print("  radar OFF — ./spotter.py --on to bring it back"); sys.exit()
         if "--on" in sys.argv:
-            OFF_FLAG.unlink(missing_ok=True)
-            print("  radar ON")
-            sys.exit()
-
-        if "--clear" in sys.argv:
-            clear()
-            sys.exit()
-
-        if OFF_FLAG.exists():
-            print("  radar is OFF  (./spotter.py --on)")
-            sys.exit()
-
+            OFF_FLAG.unlink(missing_ok=True); print("  radar ON"); sys.exit()
+        if OFF_FLAG.exists() and "--clear" not in sys.argv:
+            print("  radar is OFF  (./spotter.py --on)"); sys.exit()
+        if "--clear" in sys.argv: clear(); sys.exit()
         if "--watch" in sys.argv:
             print("  watching — ctrl-c to stop\n")
+            last = None
             while True:
                 if OFF_FLAG.exists():
-                    print("  radar switched off — stopping")
-                    clear()
-                    break
+                    print("  radar switched off — stopping"); clear(); break
                 try:
-                    once()
-                except Exception as e:
-                    # keep the cadence on failure: never hammer a community API
-                    print(f"  {type(e).__name__}: {e}")
+                    a = once()
+                    if a: last = (a.get("flight") or "").strip()
+                except FeedDown as e: print(f"  feed down — {e}")
+                except Exception as e: print(f"  {type(e).__name__}: {e}")
                 time.sleep(20)
         else:
+            # launchd runs THIS path. It had no handler, so a feed outage was an
+            # uncaught traceback straight into the log (and the log used to be
+            # /dev/null). Report it and exit non-zero so the caller can tell.
             try:
                 once()
-            except Exception as e:
-                print(f"  could not reach adsb.lol: {type(e).__name__}: {e}")
+            except FeedDown as e:
+                print(f"  adsb.lol unavailable — {e}", file=sys.stderr)
                 sys.exit(1)
-
     except KeyboardInterrupt:
-        print("\n  stopped")
+        print("\n  Radar watch stopped" if "--watch" in sys.argv else "\n  stopped")
         sys.exit(0)
