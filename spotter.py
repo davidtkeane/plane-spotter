@@ -120,15 +120,50 @@ def route_short(cs):
     r = route_for(cs)
     return f"{r['from']}>{r['to']}" if r else ""
 
-def route_board(cs):
-    """'ALC Alicante > DUB Dublin' — code AND name, so the codes get learned.
-    Trimmed to fit a 1.47" screen at text size 1 (about 50 characters)."""
+def _ascii(s):
+    """Fold to plain ASCII for the board.
+
+    The screen's font is a 5x7 CP437 BITMAP, not Unicode. 'Montréal' is
+    'Montr\xc3\xa9al' in UTF-8 — two bytes the renderer draws as two unrelated
+    glyphs, so the board showed mojibake where a city name should be. The
+    TERMINAL keeps the real accents (see route_long); only the board is folded.
+    """
+    import unicodedata
+    out = []
+    for ch in s:
+        if ch in "\u00d8\u00f8": out.append("O" if ch.isupper() else "o"); continue
+        if ch in "\u00c6\u00e6": out.append("AE" if ch.isupper() else "ae"); continue
+        if ch == "\u00df":        out.append("ss"); continue
+        if ch in "\u0141\u0142": out.append("L" if ch.isupper() else "l"); continue
+        if ch in "\u0110\u0111": out.append("D" if ch.isupper() else "d"); continue
+        d = unicodedata.normalize("NFKD", ch)
+        out.append("".join(c for c in d if not unicodedata.combining(c)))
+    return "".join(out).encode("ascii", "replace").decode("ascii")
+
+def route_board(cs, width=52):
+    """'YUL Montreal, CA > CDG Paris, FR' — code, city AND country.
+
+    The country is the half that makes a code mean something: 'CFU' is noise,
+    'CFU Kerkyra Island, GR' is a place you can picture. But the panel is only so
+    wide, so this DEGRADES rather than truncating mid-word — a name cut to
+    'Kerkyra Isla' is worse than no name at all.
+
+    width is the character budget at text size 1: about 52 in landscape (320px /
+    6px per char) and 28 in portrait (172px).
+    """
     r = route_for(cs)
     if not r: return ""
-    txt = f"{r['from']} {r['from_name']} > {r['to']} {r['to_name']}"
-    if len(txt) > 50:                       # long city names — drop to codes plus one name
-        txt = f"{r['from']} > {r['to']} {r['to_name']}"[:50]
-    return txt
+    fn, tn = _ascii(r["from_name"]), _ascii(r["to_name"])
+    fc, tc = r["from_cc"], r["to_cc"]
+    # most informative first; take the first that fits
+    for txt in (
+        f"{r['from']} {fn}{', ' + fc if fc else ''} > {r['to']} {tn}{', ' + tc if tc else ''}",
+        f"{r['from']} {fn} > {r['to']} {tn}",
+        f"{r['from']} > {r['to']} {tn}",
+        f"{r['from']} > {r['to']}",
+    ):
+        if len(txt) <= width: return txt
+    return f"{r['from']}>{r['to']}"[:width]
 
 def route_long(cs):
     """'Lisbon, PT -> Dublin, IE' for the terminal, or ''."""
@@ -230,8 +265,12 @@ def pick():
 def as_contact(a):
     d, approaching, cpa, tmin = geometry(a)
     cs = (a.get("flight") or "?").strip()
-    return {"route": route_short(cs) if a.get("_primary") else "",
-            "routefull": route_board(cs) if a.get("_primary") else "",
+    prim = a.get("_primary")
+    return {"route": route_short(cs) if prim else "",
+            # two budgets, because the board cannot tell Python its rotation:
+            # 52 chars for landscape, 28 for portrait. Firmware picks one.
+            "routefull": route_board(cs, 52) if prim else "",
+            "routemid":  route_board(cs, 28) if prim else "",
             "east": round(a["_e"], 2), "north": round(a["_n"], 2),
             "track": a.get("track", 0), "gs": a.get("gs", 0),
             "alt": int(a["alt_baro"]), "cs": cs, "type": a.get("t", ""),
