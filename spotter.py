@@ -58,6 +58,73 @@ AIRLINES = {
  "UPS":"UPS","GTI":"Atlas","CGI":"Coast Guard","IRC":"Irish Coast Gd",
  "RRR":"RAF","IAM":"Irish Air Corps","NJE":"NetJets","BCS":"DHL",
 }
+# ── route lookup ────────────────────────────────────────────────────────────
+# ADS-B does NOT broadcast a destination — the transponder has no idea where the
+# aircraft is going. adsb.lol publishes a separate route endpoint keyed on
+# callsign. A route does not change mid-flight, so it is cached for the session
+# and only the PRIMARY aircraft is looked up: one extra request per poll at most,
+# against a free community API.
+_routes = {}
+
+def route_for(cs):
+    """-> {'from','to','from_name','to_name','from_cc','to_cc'} or None.
+
+    The API returns full airport names and cities as well as the codes, so keep
+    both: the board wants 'LIS > DUB' because the screen is 1.47 inches, but a
+    terminal has room for 'Lisbon, PT -> Dublin, IE' — which is what you actually
+    want to read when you hear one overhead.
+    Cached; never raises.
+    """
+    if not cs or not cs[:3].isalpha(): return None
+    if cs in _routes: return _routes[cs]
+    try:
+        req = urllib.request.Request(f"https://api.adsb.lol/api/0/route/{cs}",
+                                     headers={"User-Agent": "plane-spotter/0.1"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            d = json.load(r)
+    except Exception:
+        # DO NOT cache this. "I could not ask" is not "there is no route" — and
+        # the first version cached the timeout permanently, so a slow first call
+        # meant that flight never showed a destination for the rest of the
+        # session. Absence of an answer is not a fact.
+        return None
+    iata = d.get("_airport_codes_iata") or ""
+    if "-" not in iata:
+        _routes[cs] = None                   # asked, genuinely no route — cache that
+        return None
+    a, b = [x.strip()[:4] for x in iata.split("-", 1)]
+    ports = {p.get("iata"): p for p in (d.get("_airports") or []) if p.get("iata")}
+    def nm(code):
+        p = ports.get(code, {})
+        return (p.get("location") or p.get("name") or code, p.get("countryiso2") or "")
+    fn, fc = nm(a); tn, tc = nm(b)
+    _routes[cs] = {"from": a, "to": b, "from_name": fn, "to_name": tn,
+                   "from_cc": fc, "to_cc": tc}
+    return _routes[cs]
+
+def route_short(cs):
+    """'LIS>DUB' for the board, or '' — the screen has no room for names."""
+    r = route_for(cs)
+    return f"{r['from']}>{r['to']}" if r else ""
+
+def route_board(cs):
+    """'ALC Alicante > DUB Dublin' — code AND name, so the codes get learned.
+    Trimmed to fit a 1.47" screen at text size 1 (about 50 characters)."""
+    r = route_for(cs)
+    if not r: return ""
+    txt = f"{r['from']} {r['from_name']} > {r['to']} {r['to_name']}"
+    if len(txt) > 50:                       # long city names — drop to codes plus one name
+        txt = f"{r['from']} > {r['to']} {r['to_name']}"[:50]
+    return txt
+
+def route_long(cs):
+    """'Lisbon, PT -> Dublin, IE' for the terminal, or ''."""
+    r = route_for(cs)
+    if not r: return ""
+    f = r["from_name"] + (f", {r['from_cc']}" if r["from_cc"] else "")
+    t = r["to_name"]   + (f", {r['to_cc']}"   if r["to_cc"]   else "")
+    return f"{f} → {t}"
+
 def airline(cs):
     return AIRLINES.get(cs[:3].upper(), "")
 
@@ -147,7 +214,9 @@ def pick():
 def as_contact(a):
     d, approaching, cpa, tmin = geometry(a)
     cs = (a.get("flight") or "?").strip()
-    return {"east": round(a["_e"], 2), "north": round(a["_n"], 2),
+    return {"route": route_short(cs) if a.get("_primary") else "",
+            "routefull": route_board(cs) if a.get("_primary") else "",
+            "east": round(a["_e"], 2), "north": round(a["_n"], 2),
             "track": a.get("track", 0), "gs": a.get("gs", 0),
             "alt": int(a["alt_baro"]), "cs": cs, "type": a.get("t", ""),
             "dist": round(d, 1), "approaching": bool(approaching),
@@ -156,6 +225,7 @@ def as_contact(a):
 
 def push(planes):
     """planes[0] is the primary — labelled, trailed, and on the gauge."""
+    for i, a in enumerate(planes): a["_primary"] = (i == 0)
     payload = json.dumps({"planes": [as_contact(a) for a in planes[:10]],
                           "range": RANGE_KM})
     host = CACHE.read_text().strip() if CACHE.exists() else "rangerpuck.local"
@@ -199,9 +269,15 @@ def once(quiet=False):
 
         print()
         name = f"{C['B']}{C['w']}{cs}{C['N']}" + (f"{C['d']} · {C['N']}{who}" if who else "")
-        print(f"  ✈️  {name}  {C['d']}{a.get('t','')}{C['N']}"
+        rt = route_for(cs)
+        routetxt = (f"   {C['g']}{rt['from']} → {rt['to']}{C['N']}") if rt else ""
+        print(f"  ✈️  {name}  {C['d']}{a.get('t','')}{C['N']}{routetxt}"
               f"   {C['w']}{heading_arrow(a.get('track',0))}{C['N']}"
               f"{C['d']} {compass(a.get('track',0))}{C['N']}")
+        long = route_long(cs)
+        if long:
+            arriving = "arriving from" if (a.get("baro_rate") or 0) < -200 else "flying"
+            print(f"      {C['g']}{arriving}  {long}{C['N']}")
         print(f"      {tcol}{ARROW[trend]} {int(a['alt_baro']):,} ft {trend}{C['N']}"
               f"{C['d']} · {C['N']}{a.get('gs',0):.0f} kt"
               f"{C['d']} · {C['N']}{dcol}{d:.1f} km {brg}{C['N']}"
@@ -216,7 +292,7 @@ def once(quiet=False):
         others = allac[1:9]
         if others:
             print(f"\n    {C['d']}also in range{C['N']}")
-            print(f"    {C['d']}{'':<3}{'callsign':<10}{'airline':<13}{'type':<5}"
+            print(f"    {C['d']}{'':<3}{'callsign':<10}{'route':<9}{'airline':<13}{'type':<5}"
                   f"{'altitude':>9}{'dist':>8} {'brg':<5}{C['N']}")
             for o in others:
                 od, oapp, _, _ = geometry(o)
@@ -230,8 +306,13 @@ def once(quiet=False):
                 acol = C['y'] if ot == "descending" else C['c'] if ot == "climbing" else C['d']
                 body = C['N'] if oapp else C['d']
                 ohdg = heading_arrow(o.get("track", 0))
+                # cache-only: a route already fetched costs nothing to show, and we
+                # do not fire extra requests at a free community API for the list
+                orte = _routes.get(ocs)
+                otxt = f"{orte['from']}>{orte['to']}" if orte else ""
                 print(f"    {body}✈{C['N']}{C['w'] if oapp else C['d']}{ohdg}{C['N']} "
-                      f"{body}{ocs:<10}{C['N']}{body}{(airline(ocs) or '·'):<13}{C['N']}"
+                      f"{body}{ocs:<10}{C['N']}{C['g'] if orte else ''}{otxt:<9}{C['N']}"
+                      f"{body}{(airline(ocs) or '·'):<13}{C['N']}"
                       f"{body}{o.get('t',''):<5}{C['N']}"
                       f"{acol}{ARROW[ot]}{C['N']}{body}{int(o['alt_baro']):>7,}ft{C['N']}"
                       f"{body}{od:>7.1f}km {obrg:<4}{C['N']}"
