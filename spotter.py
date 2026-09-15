@@ -36,6 +36,13 @@ def _cfg(name, default):
 LAT      = float(_cfg("SPOTTER_LAT", 53.4264))     # Dublin Airport
 LON      = float(_cfg("SPOTTER_LON", -6.2499))
 RANGE_KM = float(_cfg("SPOTTER_RANGE_KM", 40))
+# A plane genuinely overhead should INTERRUPT the desk, not wait its turn in the
+# ambient rotation. When the primary is within OVERHEAD_KM horizontally and low
+# enough to actually notice, fire a high-urgency "look up" alert to /state — the
+# firmware's SKY state (urgency 45, violet, "something overhead"). It mirrors the
+# real event, then clears itself ~66s after the plane stops being overhead.
+OVERHEAD_KM = float(_cfg("SPOTTER_OVERHEAD_KM", 5.0))    # horizontal km to count as "overhead"
+OVERHEAD_FT = float(_cfg("SPOTTER_OVERHEAD_FT", 20000))  # ignore high overflights you would never notice
 SEND = Path.home() / "esp32-projects/1-ranger-puck/tools/send.sh"
 CACHE = Path.home() / ".ranger-memory/config/rangerpuck.ip"
 
@@ -304,6 +311,29 @@ def clear():
     except Exception as e:
         print(f"  could not clear: {e}")
 
+def alert_overhead(a, cs, d):
+    """Fire a high-urgency 'look up' alert to /state so an overhead plane interrupts
+    the ambient rotation. Reuses the firmware SKY state (urgency 45, violet). Re-sent
+    each poll while overhead; the board expires it ~66s after the last push, so it
+    clears itself once the plane has moved on."""
+    alt = int(a.get("alt_baro") or 0); typ = (a.get("t") or "").strip()
+    l1 = ((cs or "plane") + " overhead")[:20]
+    l2 = (f"{alt:,}ft {typ}").strip()[:20]
+    payload = json.dumps({"who": "PLANE", "state": "SKY", "line1": l1, "line2": l2})
+    host = CACHE.read_text().strip() if CACHE.exists() else "rangerpuck.local"
+    for h in (host, "rangerpuck.local"):
+        try:
+            req = urllib.request.Request(f"http://{h}/state", data=payload.encode(),
+                                         headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=4).read()
+            return True
+        except Exception:
+            continue
+    return False
+
+_overhead = {"cs": None}   # announce a newly-overhead plane once in the terminal
+
+
 def once(quiet=False):
     r = pick()
     if not r:
@@ -314,6 +344,22 @@ def once(quiet=False):
     cs = (a.get("flight") or "?").strip()
     ok = push(allac)
     d, approaching, cpa, tmin = geometry(a)
+    # overhead → interrupt the desk with a look-up alert (mirrors the real event).
+    # Scan the CLOSEST aircraft, not the display primary (which is scored for interest
+    # and may be a distant inbound). Whatever is genuinely above you wins the alert.
+    low = [x for x in allac if (x.get("alt_baro") or 0) <= OVERHEAD_FT]
+    oh = min(low, key=lambda x: math.hypot(x["_e"], x["_n"]), default=None)
+    ohd = math.hypot(oh["_e"], oh["_n"]) if oh else 1e9
+    if oh and ohd <= OVERHEAD_KM:
+        ohcs = (oh.get("flight") or "?").strip()
+        alert_overhead(oh, ohcs, ohd)
+        if _overhead["cs"] != ohcs:
+            _overhead["cs"] = ohcs
+            if not quiet:
+                print(f"  {C['B']}{C['y']}\u2b06  OVERHEAD \u2192 puck alert: {ohcs} at "
+                      f"{int(oh.get('alt_baro') or 0):,}ft, {ohd:.1f} km{C['N']}")
+    else:
+        _overhead["cs"] = None
     vs = a.get("baro_rate") or 0
     trend = "climbing" if vs > 200 else "descending" if vs < -200 else "level"
     who = airline(cs)
@@ -409,7 +455,13 @@ if __name__ == "__main__":
             OFF_FLAG.parent.mkdir(parents=True, exist_ok=True); OFF_FLAG.touch()
             clear(); print("  radar OFF — ./spotter.py --on to bring it back"); sys.exit()
         if "--on" in sys.argv:
-            OFF_FLAG.unlink(missing_ok=True); print("  radar ON"); sys.exit()
+            OFF_FLAG.unlink(missing_ok=True); print("  radar ON")
+            # under launchd a clean --off exit is not auto-restarted (KeepAlive
+            # SuccessfulExit=false), so kick the service back to life if it exists.
+            subprocess.run(["launchctl", "kickstart", "-k",
+                            f"gui/{os.getuid()}/com.ranger.plane-spotter"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            sys.exit()
         if OFF_FLAG.exists() and "--clear" not in sys.argv:
             print("  radar is OFF  (./spotter.py --on)"); sys.exit()
         if "--clear" in sys.argv: clear(); sys.exit()

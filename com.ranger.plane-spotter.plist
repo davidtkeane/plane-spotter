@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.ranger.plane-spotter</string>
+
+  <!-- bash -lc so ~/.profile sets PATH consistently with the other collectors.
+       --watch keeps one process alive (preserves radar stickiness) and polls
+       every 20s; it also fires the overhead "look up" alert to the puck. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>exec python3 -u "$HOME/esp32-projects/3-plane-spotter/spotter.py" --watch</string>
+  </array>
+
+  <key>RunAtLoad</key><true/>
+  <!-- restart on CRASH only; a clean exit (radar turned OFF via --off) stays off -->
+  <key>KeepAlive</key>
+  <dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key><integer>30</integer>
+
+  <key>StandardOutPath</key><string>/Users/ranger/.ranger-memory/logs/spotter.log</string>
+  <key>StandardErrorPath</key><string>/Users/ranger/.ranger-memory/logs/spotter.log</string>
+</dict>
+</plist>
